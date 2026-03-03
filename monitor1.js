@@ -1,11 +1,8 @@
-// =============================
-// IMPORTACIONES
-// =============================
+// monitor.js
 const sqlite3 = require("sqlite3").verbose();
 const net = require("net");
 const axios = require("axios");
-const ping = require("ping");
-const { IPS } = require("./terminales");
+const { IPS, PUERTOS_COMUNES } = require("./terminales");
 
 // =============================
 // TELEGRAM
@@ -18,15 +15,11 @@ async function enviarTelegram(mensaje) {
     for (const chat_id of CHAT_IDS) {
       await axios.post(
         `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
-        {
-          chat_id,
-          text: mensaje,
-          parse_mode: "Markdown",
-        }
+        { chat_id, text: mensaje, parse_mode: "Markdown" },
       );
     }
   } catch (err) {
-    console.error("Error enviando Telegram:", err.message);
+    console.error("Error Telegram:", err.message);
   }
 }
 
@@ -49,11 +42,7 @@ db.serialize(() => {
   `);
 });
 
-// =============================
-// VARIABLES DE CONTROL
-// =============================
 let estadoActual = {};
-const CHECK_INTERVAL = 10000;
 
 // =============================
 // TCP CHECK
@@ -79,7 +68,7 @@ function pingTCP(host, port, timeout = 3000) {
       if (!terminado) {
         terminado = true;
         socket.destroy();
-        resolve({ alive: false });
+        resolve({ alive: false, port });
       }
     });
 
@@ -87,7 +76,7 @@ function pingTCP(host, port, timeout = 3000) {
       if (!terminado) {
         terminado = true;
         socket.destroy();
-        resolve({ alive: false });
+        resolve({ alive: false, port });
       }
     });
 
@@ -96,30 +85,10 @@ function pingTCP(host, port, timeout = 3000) {
 }
 
 // =============================
-// ICMP PING
-// =============================
-async function pingICMP(host) {
-  try {
-    const res = await ping.promise.probe(host, {
-      timeout: 3,
-    });
-
-    if (res.alive) {
-      return {
-        alive: true,
-        latency: parseFloat(res.time),
-      };
-    } else {
-      return { alive: false };
-    }
-  } catch (err) {
-    return { alive: false };
-  }
-}
-
-// =============================
 // MONITOR PRINCIPAL
 // =============================
+const CHECK_INTERVAL = 10000;
+
 async function monitor() {
   for (const nombre in IPS) {
     try {
@@ -127,32 +96,37 @@ async function monitor() {
       let ip = target;
       let puertoDefinido = null;
 
-      // Detectar si tiene puerto
       if (target.includes(":")) {
         [ip, puertoDefinido] = target.split(":");
         puertoDefinido = parseInt(puertoDefinido);
       }
+
+      const puertosAProbar = puertoDefinido
+        ? [puertoDefinido]
+        : PUERTOS_COMUNES;
+      const resultados = await Promise.all(
+        puertosAProbar.map((p) => pingTCP(ip, p)),
+      );
 
       let estado = "DOWN";
       let latencia = 0;
       let serviciosUp = [];
 
       if (puertoDefinido) {
-        // 🔥 Caso TCP
-        const res = await pingTCP(ip, puertoDefinido);
-
+        // ⚡ Solo el puerto definido importa
+        const res = resultados[0];
         if (res.alive) {
           estado = "UP";
           latencia = res.latency;
-          serviciosUp = [puertoDefinido];
+          serviciosUp = [res.port];
         }
       } else {
-        // 🔥 Caso ICMP (ping normal)
-        const res = await pingICMP(ip);
-
-        if (res.alive) {
+        // ⚡ Caso general: tomar el primero que esté abierto
+        const abiertos = resultados.filter((r) => r.alive);
+        if (abiertos.length > 0) {
           estado = "UP";
-          latencia = res.latency;
+          latencia = abiertos[0].latency;
+          serviciosUp = abiertos.map((r) => r.port);
         }
       }
 
@@ -161,18 +135,16 @@ async function monitor() {
       // Guardar en BD
       db.run(
         "INSERT INTO logs (nombre, ip, estado, latencia, servicios) VALUES (?, ?, ?, ?, ?)",
-        [nombre, key, estado, latencia, serviciosUp.join(",")]
+        [nombre, key, estado, latencia, serviciosUp.join(",")],
       );
 
-      // Notificar solo si cambia estado
       if (!estadoActual[key] || estadoActual[key] !== estado) {
         const emoji = estado === "UP" ? "🟢" : "🔴";
-        const ipMostrar = puertoDefinido
-          ? `${ip}:${puertoDefinido}`
-          : ip;
 
-        const mensaje = `*${nombre}*\n${ipMostrar} ${emoji}\nLatencia: ${latencia} ms`;
+        // Mostrar IP y puerto si existe
+        const ipConPuerto = puertoDefinido ? `${ip}:${puertoDefinido}` : ip;
 
+        const mensaje = `*${nombre}* - ${ipConPuerto} ${emoji}  ${latencia} ms`;
         await enviarTelegram(mensaje);
       }
 
@@ -185,12 +157,9 @@ async function monitor() {
   }
 }
 
-// =============================
-// INICIAR MONITOR
-// =============================
 function iniciarMonitor() {
-  monitor(); // Ejecutar inmediatamente
-  setInterval(monitor, CHECK_INTERVAL);
+  monitor(); // Ejecutar al inicio
+  setInterval(monitor, CHECK_INTERVAL); // Repetir cada 10s
 }
 
 module.exports = { iniciarMonitor, db };
